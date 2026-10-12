@@ -10,7 +10,7 @@
 <script type="module">
   import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
   import {
-    getFirestore, collection, addDoc, getDocs, deleteDoc, updateDoc, doc, serverTimestamp, query, orderBy, where
+    getFirestore, collection, addDoc, setDoc, getDocs, deleteDoc, updateDoc, doc, serverTimestamp, query, orderBy, where
   } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 
   const firebaseConfig = {
@@ -25,7 +25,7 @@
   const app = initializeApp(firebaseConfig);
   const db = getFirestore(app);
 
-  window.__fb = { db, collection, addDoc, getDocs, deleteDoc, updateDoc, doc, serverTimestamp, query, orderBy, where };
+  window.__fb = { db, collection, addDoc, setDoc, getDocs, deleteDoc, updateDoc, doc, serverTimestamp, query, orderBy, where };
   window.dispatchEvent(new Event('firebase-ready'));
 </script>
 
@@ -828,6 +828,63 @@ form.querySelectorAll('input[required], input[pattern], input[type="email"], sel
   update();
 })();
 
+/* ================= ضمان عدم فقدان أي طالب =================
+   - كل استمارة تُحفظ أولاً على جهاز الطالب (localStorage) ثم تُرسل.
+   - رقم الطلب هو نفسه رقم المستند في قاعدة البيانات، فإعادة الإرسال لا تُكرّر السجل.
+   - إذا انقطع الإنترنت يُعاد الإرسال تلقائياً حتى ينجح.
+   - لا يتم حذف أي سجل من هذه الصفحة إطلاقاً. */
+const PENDING_KEY = 'sanad_pending_students_v1';
+function loadPending(){ try{ return JSON.parse(localStorage.getItem(PENDING_KEY) || '[]'); }catch(e){ return []; } }
+function savePending(list){ try{ localStorage.setItem(PENDING_KEY, JSON.stringify(list)); return true; }catch(e){ return false; } }
+function removePending(ref){ savePending(loadPending().filter(r => r.referenceNumber !== ref)); }
+function withTimeout(p, ms){
+  return Promise.race([p, new Promise((_, rej) => setTimeout(() => rej({ code:'timeout' }), ms))]);
+}
+function makeRefNumber(){
+  let rand = '';
+  try{ rand = Array.from(crypto.getRandomValues(new Uint8Array(4))).map(b => b.toString(16).padStart(2,'0')).join(''); }
+  catch(e){ rand = Math.random().toString(16).slice(2, 10); }
+  return 'STU-' + Date.now().toString(36).toUpperCase() + '-' + rand.toUpperCase();
+}
+async function sendRecord(rec){
+  await withTimeout(fbReadyPromise, 20000);
+  await withTimeout(
+    fb.setDoc(fb.doc(fb.db, COLLECTION_NAME, rec.referenceNumber), { ...rec, createdAt: fb.serverTimestamp() }),
+    40000
+  );
+}
+let flushing = false;
+async function flushPending(){
+  if (flushing) return;
+  const list = loadPending();
+  if (list.length === 0) return;
+  flushing = true;
+  const sent = [];
+  for (const rec of list){
+    try{ await sendRecord(rec); removePending(rec.referenceNumber); sent.push(rec.referenceNumber); }
+    catch(e){ console.warn('retry later', rec.referenceNumber, e && (e.code || e.message)); }
+  }
+  flushing = false;
+  if (sent.length){
+    refNumOut.textContent = sent.join('، ');
+    successMsg.style.display = 'block';
+  }
+}
+function resetFormUI(){
+  form.reset();
+  updateIdTypeFields();
+  fatherIdBlock.classList.add('hidden');
+  form.querySelectorAll('.field-ok,.field-bad').forEach(el => el.classList.remove('field-ok','field-bad'));
+  photoBase64 = "";
+  photoBox.classList.remove('has-img');
+  photoBox.innerHTML = `<div class="icon">📸</div><div class="txt">اضغط لاختيار صورة من الكاميرا أو المعرض</div>`;
+  photoBox.appendChild(photoInput);
+  updateCompletion();
+}
+window.addEventListener('online', flushPending);
+setInterval(flushPending, 60000);
+setTimeout(flushPending, 3000);
+
 let isSubmitting = false;
 
 form.addEventListener('submit', async (e) => {
@@ -882,9 +939,7 @@ form.addEventListener('submit', async (e) => {
   submitBtn.textContent = 'جارِ الإرسال...';
   isSubmitting = true;
 
-  await fbReadyPromise;
-
-  const refNumber = 'STU-' + Date.now().toString().slice(-8);
+  const refNumber = makeRefNumber();
 
   const data = {
     referenceNumber: refNumber,
@@ -937,51 +992,36 @@ form.addEventListener('submit', async (e) => {
     landmark: document.getElementById('landmark').value.trim(),
     email: document.getElementById('email').value.trim(),
     photo: photoBase64,
-    createdAt: fb.serverTimestamp()
+    clientCreatedAt: new Date().toISOString()
   };
 
-  try{
-    // 1) احفظ السجل الجديد أولاً حتى لا تضيع البيانات إذا فشل الإرسال
-    const newDoc = await fb.addDoc(fb.collection(fb.db, COLLECTION_NAME), data);
+  // 1) احفظ نسخة على الجهاز قبل أي محاولة إرسال
+  const pendingList = loadPending();
+  pendingList.push(data);
+  const savedLocally = savePending(pendingList);
 
-    // 2) بعدها احذف أي سجل قديم بنفس رقم الهوية (يبقى آخر إرسال فقط)
-    const idNumberForDup = data.unifiedCardNumber || data.civilIdNumber || '';
-    if (idNumberForDup){
-      for (const field of ['unifiedCardNumber','civilIdNumber']){
-        try{
-          const dupQ = fb.query(fb.collection(fb.db, COLLECTION_NAME), fb.where(field, '==', idNumberForDup));
-          const dupSnap = await fb.getDocs(dupQ);
-          for (const docSnap of dupSnap.docs){
-            if (docSnap.id !== newDoc.id) await fb.deleteDoc(fb.doc(fb.db, COLLECTION_NAME, docSnap.id));
-          }
-        }catch(dupErr){
-          console.error('duplicate cleanup failed for field', field, dupErr);
-        }
-      }
-    }
+  try{
+    // 2) أرسل إلى قاعدة البيانات (نفس رقم الطلب = نفس المستند، فلا تكرار عند إعادة المحاولة)
+    await sendRecord(data);
+    removePending(refNumber);
     successMsg.style.display = 'block';
     refNumOut.textContent = refNumber;
-    form.reset();
-    updateIdTypeFields();
-    fatherIdBlock.classList.add('hidden');
-    form.querySelectorAll('.field-ok,.field-bad').forEach(el => el.classList.remove('field-ok','field-bad'));
-    photoBase64 = "";
-    photoBox.classList.remove('has-img');
-    photoBox.innerHTML = `<div class="icon">📸</div><div class="txt">اضغط لاختيار صورة من الكاميرا أو المعرض</div>`;
-    photoBox.appendChild(photoInput);
-    updateCompletion();
+    resetFormUI();
     window.scrollTo({top:0, behavior:'smooth'});
   }catch(err){
     console.error(err);
     formMsg.className = 'msg err';
-    if (err.code === 'permission-denied'){
-      formMsg.textContent = 'تعذّر الإرسال بسبب إعدادات الصلاحيات في قاعدة البيانات. الرجاء إبلاغ إدارة المدرسة بهذه المشكلة التقنية.';
-    } else if (err.code === 'unavailable' || err.code === 'deadline-exceeded'){
-      formMsg.textContent = '⚠ الاتصال بالخادم كان بطيئاً أو انقطع أثناء الإرسال. قد تكون بياناتك وصلت فعلاً رغم هذه الرسالة — تحقق من لوحة الإدارة قبل إعادة الإرسال حتى لا تتكرر بياناتك. إذا لم تكن موجودة، أعد المحاولة.';
+    if (savedLocally){
+      // البيانات محفوظة على الجهاز وستُرسل تلقائياً عند توفر الاتصال
+      resetFormUI();
+      formMsg.textContent = err && err.code === 'permission-denied'
+        ? 'بياناتك محفوظة على هذا الجهاز لكن الإرسال مرفوض من إعدادات قاعدة البيانات. أبلغ إدارة المدرسة، ولا تمسح بيانات المتصفح. رقم الطلب: ' + refNumber
+        : '⚠ لم يكتمل الإرسال بسبب الاتصال، لكن بياناتك محفوظة على هذا الجهاز وستُرسل تلقائياً عند توفر الإنترنت. ابقَ على هذه الصفحة أو افتحها لاحقاً من نفس المتصفح، ولا تعيد تعبئة الاستمارة. رقم الطلب: ' + refNumber;
     } else {
-      formMsg.textContent = 'حدث خطأ أثناء الإرسال (' + (err.code || err.message || 'غير معروف') + '). تحقق من الاتصال بالإنترنت وحاول مرة أخرى.';
+      formMsg.textContent = 'تعذّر الإرسال (' + (err && (err.code || err.message) || 'غير معروف') + '). بياناتك ما زالت في الاستمارة، تحقق من الاتصال وأعد الضغط على إرسال.';
     }
     formMsg.style.display = 'block';
+    window.scrollTo({top:0, behavior:'smooth'});
   }finally{
     isSubmitting = false;
     submitBtn.disabled = false;
